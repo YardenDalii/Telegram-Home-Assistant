@@ -1,0 +1,29 @@
+[Unit]
+Description=Home Automation Telegram Bot
+Documentation=https://github.com/your-username/whatsapp-bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Run as the 'pi' user (change if your Pi user is different)
+User=pi
+Group=pi
+
+# Paths are updated automatically by install_service.sh
+WorkingDirectory=/home/pi/whatsapp-bot
+ExecStart=/home/pi/whatsapp-bot/venv/bin/python /home/pi/whatsapp-bot/src/main.py
+EnvironmentFile=/home/pi/whatsapp-bot/.env
+
+# Restart on failure
+Restart=on-failure
+RestartSec=10
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=homebot
+
+[Install]
+WantedBy=multi-user.target
