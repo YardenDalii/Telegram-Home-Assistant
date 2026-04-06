@@ -89,6 +89,7 @@ _MODEL_PROFILES: list[tuple[str, dict]] = [
 
 def _get_model_profile() -> dict:
     """Return the tuning profile for the currently configured model."""
+    from config import Config
     model = Config.OLLAMA_MODEL.lower()
     for key, profile in _MODEL_PROFILES:
         if key == "default" or key in model:
