@@ -1,27 +1,19 @@
 """Conversational AI home assistant using a local Ollama model.
 
 Handles plain-text messages from authorized users. Uses Ollama's tool-calling
-API (OpenAI-compatible format) to detect intent and dispatch to shopping list
-and reminder functions. All user-facing messages are in Hebrew.
+API (OpenAI-compatible format) to detect intent and dispatch to tool functions.
+All user-facing messages are in Hebrew.
 
-Recommended model: qwen3.5:9b
-  - ~6.6 GB RAM (Q4_K_M), good tok/sec on Pi 5
-  - Excellent Hebrew quality, reliable tool calling when system prompt is English
-  - Hybrid thinking mode — disabled via think=False for low-latency responses
-  NOTE: System prompts must be in English. A Hebrew system prompt causes qwen3.5:9b
-  to reason about tool calls but output natural language instead of calling them.
-  qwen3:8b is a safe fallback if qwen3.5:9b has issues.
+Tested models:
+  - gemma4:e4b  — better Hebrew quality; set OLLAMA_MODEL=gemma4:e4b
+  - qwen3.5:9b  — reliable tool calling, good Hebrew; safe fallback
+  NOTE: System prompts must be in English for reliable tool calling.
+  NOTE: think=False suppresses chain-of-thought on models that support it (qwen3).
+        _clean_response() strips any leaked <think>...</think> blocks as a fallback.
 
 Setup on the Pi:
     curl -fsSL https://ollama.com/install.sh | sh
-    ollama pull qwen3.5:9b
-
-Qwen3 architecture notes:
-  - Thinking mode: model can emit <think>...</think> reasoning blocks.
-    We pass think=False to every chat() call to suppress this entirely.
-    _strip_think_tags() is applied as a defensive fallback.
-  - Tool calling: same OpenAI-compatible (Hermes) format as Qwen2.5 — no
-    changes needed to tool schemas or _execute_tool().
+    ollama pull gemma4:e4b   # or qwen3.5:9b
 """
 
 import asyncio
@@ -63,8 +55,62 @@ from utils.logger import get_logger
 logger = get_logger(__name__)
 
 
-_FIRST_PASS_PREDICT  = 400
-_SECOND_PASS_PREDICT = 350
+# Per-model tuning profiles — matched by substring against OLLAMA_MODEL.
+# Keys checked in order; first match wins. "default" is the fallback.
+# think: False suppresses chain-of-thought on models that support it (qwen3).
+#        Ignored silently by models that don't.
+_MODEL_PROFILES: list[tuple[str, dict]] = [
+    ("gemma4", {
+        "first_predict":  300,
+        "second_predict": 180,
+        "num_ctx":        2048,
+        "think":          False,
+        "temperature":    0.7,
+        "top_k":          20,
+    }),
+    ("qwen3", {
+        "first_predict":  400,
+        "second_predict": 250,
+        "num_ctx":        4096,
+        "think":          False,   # qwen3 native — disables CoT entirely
+        "temperature":    0.7,
+        "top_k":          20,
+    }),
+    ("qwen2.5", {
+        "first_predict":  400,
+        "second_predict": 250,
+        "num_ctx":        4096,
+        "think":          False,
+        "temperature":    0.7,
+        "top_k":          20,
+    }),
+    ("llama3", {
+        "first_predict":  350,
+        "second_predict": 200,
+        "num_ctx":        4096,
+        "think":          False,
+        "temperature":    0.8,
+        "top_k":          40,
+    }),
+    ("default", {
+        "first_predict":  350,
+        "second_predict": 200,
+        "num_ctx":        2048,
+        "think":          False,
+        "temperature":    0.7,
+        "top_k":          20,
+    }),
+]
+
+
+def _get_model_profile() -> dict:
+    """Return the tuning profile for the currently configured model."""
+    model = Config.OLLAMA_MODEL.lower()
+    for key, profile in _MODEL_PROFILES:
+        if key == "default" or key in model:
+            return profile
+    return _MODEL_PROFILES[-1][1]  # unreachable, but safe
+
 
 # Module-level Ollama client — created once on first use, reused for every message.
 _ollama_client: ollama.Client | None = None
@@ -1398,6 +1444,7 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.set_reaction([ReactionTypeEmoji(emoji="🤔")])
         _done_reaction = "👍"  # will flip to 😱 on error
 
+        _mp = _get_model_profile()
         loop = asyncio.get_event_loop()
         response = await loop.run_in_executor(
             None,
@@ -1405,8 +1452,13 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 model=Config.OLLAMA_MODEL,
                 messages=messages,
                 tools=selected_tools,
-                think=False,  # Qwen3: disable chain-of-thought for low latency
-                options={"num_ctx": Config.OLLAMA_NUM_CTX, "num_predict": _FIRST_PASS_PREDICT},
+                think=_mp["think"],
+                options={
+                    "num_ctx":     Config.OLLAMA_NUM_CTX or _mp["num_ctx"],
+                    "num_predict": _mp["first_predict"],
+                    "temperature": _mp["temperature"],
+                    "top_k":       _mp["top_k"],
+                },
                 keep_alive=Config.OLLAMA_KEEP_ALIVE,
             ),
         )
@@ -1459,8 +1511,13 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 lambda: ollama_client.chat(
                     model=Config.OLLAMA_MODEL,
                     messages=pass2_messages,
-                    think=False,
-                    options={"num_ctx": min(Config.OLLAMA_NUM_CTX, 2048), "num_predict": _SECOND_PASS_PREDICT},
+                    think=_mp["think"],
+                    options={
+                        "num_ctx":     min(Config.OLLAMA_NUM_CTX or _mp["num_ctx"], 1536),
+                        "num_predict": _mp["second_predict"],
+                        "temperature": _mp["temperature"],
+                        "top_k":       _mp["top_k"],
+                    },
                 ),
             )
             final_text = _clean_response(response2.message.content or "")
@@ -1500,7 +1557,13 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     lambda: ollama_client.chat(
                         model=Config.OLLAMA_MODEL,
                         messages=pass2_messages,
-                        think=False,
+                        think=_mp["think"],
+                        options={
+                            "num_ctx":     min(Config.OLLAMA_NUM_CTX or _mp["num_ctx"], 1536),
+                            "num_predict": _mp["second_predict"],
+                            "temperature": _mp["temperature"],
+                            "top_k":       _mp["top_k"],
+                        },
                     ),
                 )
                 final_text = _clean_response(response2.message.content or "") or t_result

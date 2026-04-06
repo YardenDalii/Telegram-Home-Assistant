@@ -60,7 +60,7 @@ class Config:
     # Ollama local AI (conversational assistant — optional, leave blank to disable)
     OLLAMA_HOST: ClassVar[str] = os.getenv("OLLAMA_HOST", "http://localhost:11434")
     OLLAMA_MODEL: ClassVar[str] = os.getenv("OLLAMA_MODEL", "qwen3.5:9b")
-    OLLAMA_NUM_CTX: ClassVar[int] = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
+    OLLAMA_NUM_CTX: ClassVar[int] = int(os.getenv("OLLAMA_NUM_CTX", "2048"))
     OLLAMA_KEEP_ALIVE: ClassVar[str] = os.getenv("OLLAMA_KEEP_ALIVE", "1h")
     OLLAMA_HISTORY_PAIRS: ClassVar[int] = int(os.getenv("OLLAMA_HISTORY_PAIRS", "5"))
 
