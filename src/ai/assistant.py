@@ -68,37 +68,21 @@ _MODEL_PROFILES: list[tuple[str, dict]] = [
         "temperature":    0.7,
         "top_k":          20,
     }),
-    ("qwen3", {
+    ("qwen3.5", {
         "first_predict":  400,
-        "second_predict": 250,
-        "num_ctx":        4096,
-        "think":          False,   # qwen3 native — disables CoT entirely
-        "temperature":    0.7,
-        "top_k":          20,
-    }),
-    ("qwen2.5", {
-        "first_predict":  400,
-        "second_predict": 250,
+        "second_predict": 350,
         "num_ctx":        4096,
         "think":          False,
-        "temperature":    0.7,
-        "top_k":          20,
-    }),
-    ("llama3", {
-        "first_predict":  350,
-        "second_predict": 200,
-        "num_ctx":        4096,
-        "think":          False,
-        "temperature":    0.8,
-        "top_k":          40,
+        "temperature":    None,
+        "top_k":          None,
     }),
     ("default", {
-        "first_predict":  350,
-        "second_predict": 200,
-        "num_ctx":        2048,
+        "first_predict":  400,
+        "second_predict": 350,
+        "num_ctx":        4096,
         "think":          False,
-        "temperature":    0.7,
-        "top_k":          20,
+        "temperature":    None,
+        "top_k":          None,
     }),
 ]
 
@@ -1445,6 +1429,21 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         _done_reaction = "👍"  # will flip to 😱 on error
 
         _mp = _get_model_profile()
+        _base_opts: dict = {
+            "num_ctx":     Config.OLLAMA_NUM_CTX or _mp["num_ctx"],
+            "num_predict": _mp["first_predict"],
+        }
+        _pass2_opts: dict = {
+            "num_ctx":     min(Config.OLLAMA_NUM_CTX or _mp["num_ctx"], 1536),
+            "num_predict": _mp["second_predict"],
+        }
+        if _mp["temperature"] is not None:
+            _base_opts["temperature"] = _mp["temperature"]
+            _pass2_opts["temperature"] = _mp["temperature"]
+        if _mp["top_k"] is not None:
+            _base_opts["top_k"] = _mp["top_k"]
+            _pass2_opts["top_k"] = _mp["top_k"]
+
         loop = asyncio.get_event_loop()
         response = await loop.run_in_executor(
             None,
@@ -1453,12 +1452,7 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 messages=messages,
                 tools=selected_tools,
                 think=_mp["think"],
-                options={
-                    "num_ctx":     Config.OLLAMA_NUM_CTX or _mp["num_ctx"],
-                    "num_predict": _mp["first_predict"],
-                    "temperature": _mp["temperature"],
-                    "top_k":       _mp["top_k"],
-                },
+                options=_base_opts,
                 keep_alive=Config.OLLAMA_KEEP_ALIVE,
             ),
         )
@@ -1512,12 +1506,7 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     model=Config.OLLAMA_MODEL,
                     messages=pass2_messages,
                     think=_mp["think"],
-                    options={
-                        "num_ctx":     min(Config.OLLAMA_NUM_CTX or _mp["num_ctx"], 1536),
-                        "num_predict": _mp["second_predict"],
-                        "temperature": _mp["temperature"],
-                        "top_k":       _mp["top_k"],
-                    },
+                    options=_pass2_opts,
                 ),
             )
             final_text = _clean_response(response2.message.content or "")
@@ -1558,12 +1547,7 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                         model=Config.OLLAMA_MODEL,
                         messages=pass2_messages,
                         think=_mp["think"],
-                        options={
-                            "num_ctx":     min(Config.OLLAMA_NUM_CTX or _mp["num_ctx"], 1536),
-                            "num_predict": _mp["second_predict"],
-                            "temperature": _mp["temperature"],
-                            "top_k":       _mp["top_k"],
-                        },
+                        options=_pass2_opts,
                     ),
                 )
                 final_text = _clean_response(response2.message.content or "") or t_result
