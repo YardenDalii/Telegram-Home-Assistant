@@ -1297,6 +1297,106 @@ def _clean_response(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Streaming helper
+# ---------------------------------------------------------------------------
+
+_STREAM_MIN_CHARS = 15   # chars before sending the first Telegram message
+_STREAM_EDIT_SECS = 1.3  # minimum seconds between Telegram edits (flood guard)
+_STREAM_CURSOR    = " ▌"  # appended while generation is in progress
+
+
+async def _stream_to_chat(
+    update: Update,
+    ollama_client,
+    call_kwargs: dict,
+) -> tuple[str, list | None, object]:
+    """Stream an Ollama response progressively into a Telegram chat message.
+
+    Runs the blocking Ollama generator in a thread executor while the async
+    loop edits the Telegram message as tokens arrive.
+
+    Returns:
+        full_text  — complete cleaned response text
+        tool_calls — list of tool calls from the final chunk, or None
+        sent_msg   — the Telegram Message that was sent/edited, or None
+    """
+    queue: asyncio.Queue[str | None] = asyncio.Queue()
+    chunks: list = []
+
+    def _producer() -> None:
+        for chunk in ollama_client.chat(**call_kwargs, stream=True):
+            chunks.append(chunk)
+            if chunk.message.content:
+                queue.put_nowait(chunk.message.content)
+        queue.put_nowait(None)  # sentinel
+
+    loop = asyncio.get_event_loop()
+    producer_fut = loop.run_in_executor(None, _producer)
+
+    sent_msg = None
+    full_text = ""
+    last_edit = 0.0
+
+    while True:
+        token = await queue.get()
+        if token is None:
+            break
+        full_text += token
+        cleaned = _clean_response(full_text)
+        # Only stream text that contains Hebrew — never show raw JSON or leaked think tags
+        if not any("\u05d0" <= ch <= "\u05ea" for ch in cleaned):
+            continue
+        now = loop.time()
+
+        if sent_msg is None and len(cleaned) >= _STREAM_MIN_CHARS:
+            try:
+                sent_msg = await update.message.reply_text(
+                    cleaned + _STREAM_CURSOR, parse_mode="Markdown"
+                )
+                last_edit = now
+            except Exception:
+                try:
+                    sent_msg = await update.message.reply_text(cleaned + _STREAM_CURSOR)
+                    last_edit = now
+                except Exception:
+                    pass
+        elif sent_msg is not None and (now - last_edit) >= _STREAM_EDIT_SECS:
+            try:
+                await sent_msg.edit_text(cleaned + _STREAM_CURSOR, parse_mode="Markdown")
+                last_edit = now
+            except Exception:
+                pass
+
+    await producer_fut
+
+    last_chunk = chunks[-1] if chunks else None
+    tool_calls = (
+        last_chunk.message.tool_calls
+        if (last_chunk and last_chunk.message and last_chunk.message.tool_calls)
+        else None
+    )
+    final_text = _clean_response(full_text)
+
+    # Finalize: remove the cursor with one last edit
+    if sent_msg is not None and final_text:
+        try:
+            await sent_msg.edit_text(final_text, parse_mode="Markdown")
+        except Exception:
+            try:
+                await sent_msg.edit_text(final_text)
+            except Exception:
+                pass
+    elif sent_msg is None and final_text and any("\u05d0" <= ch <= "\u05ea" for ch in final_text):
+        # Short response that never reached _STREAM_MIN_CHARS — send it now
+        try:
+            sent_msg = await update.message.reply_text(final_text, parse_mode="Markdown")
+        except Exception:
+            sent_msg = await update.message.reply_text(final_text)
+
+    return final_text, tool_calls, sent_msg
+
+
+# ---------------------------------------------------------------------------
 # Main handler
 # ---------------------------------------------------------------------------
 
@@ -1445,27 +1545,30 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             _base_opts["top_k"] = _mp["top_k"]
             _pass2_opts["top_k"] = _mp["top_k"]
 
-        loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(
-            None,
-            lambda: ollama_client.chat(
-                model=Config.OLLAMA_MODEL,
-                messages=messages,
-                tools=selected_tools,
-                think=_mp["think"],
-                options=_base_opts,
-                keep_alive=Config.OLLAMA_KEEP_ALIVE,
-            ),
+        # --- First pass: stream response, detect tool calls from final chunk ---
+        first_text, tool_calls, sent_msg = await _stream_to_chat(
+            update, ollama_client,
+            {
+                "model":      Config.OLLAMA_MODEL,
+                "messages":   messages,
+                "tools":      selected_tools,
+                "think":      _mp["think"],
+                "options":    _base_opts,
+                "keep_alive": Config.OLLAMA_KEEP_ALIVE,
+            },
         )
 
-        msg = response.message
-        # Strip any <think>...</think> blocks Qwen3 may still emit as a safety net
-        msg_content = _clean_response(msg.content or "")
+        if tool_calls:
+            # Tool calls detected — delete any streamed preamble text
+            if sent_msg:
+                try:
+                    await sent_msg.delete()
+                except Exception:
+                    pass
 
-        if msg.tool_calls:
             # --- Execute all tool calls and collect results ---
             tool_results: list[dict] = []
-            for tool_call in msg.tool_calls:
+            for tool_call in tool_calls:
                 t_name = tool_call.function.name
                 t_args = dict(tool_call.function.arguments) if tool_call.function.arguments else {}
                 t_result = await _execute_tool(t_name, t_args, user.id, user.username, job_queue, context.bot)
@@ -1474,13 +1577,12 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             combined_results = "\n\n".join(tr["result"] for tr in tool_results)
 
             # Passthrough tools: return raw output directly — no second-pass AI summary.
-            # Prevents hallucinated events/device states and loss of detail.
             if any(tr["name"] in _PASSTHROUGH for tr in tool_results):
                 await update.message.reply_text(combined_results, parse_mode="Markdown")
                 _append_history(user.id, "assistant", combined_results)
                 return
 
-            # --- Second-pass: let the model generate a natural Hebrew response ---
+            # --- Second-pass: stream a natural Hebrew summary ---
             pass2_messages = [
                 {
                     "role": "system",
@@ -1501,34 +1603,35 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 },
                 {"role": "tool", "content": combined_results},
             ]
-            response2 = await loop.run_in_executor(
-                None,
-                lambda: ollama_client.chat(
-                    model=Config.OLLAMA_MODEL,
-                    messages=pass2_messages,
-                    think=_mp["think"],
-                    options=_pass2_opts,
-                ),
+            final_text, _, _ = await _stream_to_chat(
+                update, ollama_client,
+                {
+                    "model":   Config.OLLAMA_MODEL,
+                    "messages": pass2_messages,
+                    "think":   _mp["think"],
+                    "options": _pass2_opts,
+                },
             )
-            final_text = _clean_response(response2.message.content or "")
-            # Fallback to raw results if second pass returned nothing useful
             if not final_text or len(final_text) < 3:
                 final_text = combined_results
-
-            await update.message.reply_text(final_text, parse_mode="Markdown")
+                await update.message.reply_text(final_text, parse_mode="Markdown")
             _append_history(user.id, "assistant", final_text)
 
-        elif msg_content:
-            parsed = _parse_tool_from_content(msg_content)
+        elif first_text:
+            parsed = _parse_tool_from_content(first_text)
             if parsed:
                 t_name, t_args = parsed
+                # Delete any streamed content — this is a fallback tool call
+                if sent_msg:
+                    try:
+                        await sent_msg.delete()
+                    except Exception:
+                        pass
                 t_result = await _execute_tool(t_name, t_args, user.id, user.username, job_queue, context.bot)
-                # Passthrough tools: return raw result directly (no second pass)
                 if t_name in _PASSTHROUGH:
                     await update.message.reply_text(t_result, parse_mode="Markdown")
                     _append_history(user.id, "assistant", t_result)
                     return
-                # Second pass for fallback-parsed tools too
                 pass2_messages = [
                     {
                         "role": "system",
@@ -1542,23 +1645,27 @@ async def handle_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                     {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": t_name, "arguments": {}}}]},
                     {"role": "tool", "content": t_result},
                 ]
-                response2 = await loop.run_in_executor(
-                    None,
-                    lambda: ollama_client.chat(
-                        model=Config.OLLAMA_MODEL,
-                        messages=pass2_messages,
-                        think=_mp["think"],
-                        options=_pass2_opts,
-                    ),
+                final_text, _, _ = await _stream_to_chat(
+                    update, ollama_client,
+                    {
+                        "model":   Config.OLLAMA_MODEL,
+                        "messages": pass2_messages,
+                        "think":   _mp["think"],
+                        "options": _pass2_opts,
+                    },
                 )
-                final_text = _clean_response(response2.message.content or "") or t_result
-                await update.message.reply_text(final_text, parse_mode="Markdown")
-                _append_history(user.id, "assistant", final_text)
+                final_text = final_text or t_result
+                if not final_text or len(final_text) < 3:
+                    await update.message.reply_text(t_result, parse_mode="Markdown")
+                _append_history(user.id, "assistant", final_text or t_result)
             else:
-                await update.message.reply_text(msg_content, parse_mode="Markdown")
-                _append_history(user.id, "assistant", msg_content)
+                # Pure conversational reply — already streamed to the user
+                if not sent_msg:
+                    await update.message.reply_text(first_text, parse_mode="Markdown")
+                _append_history(user.id, "assistant", first_text)
         else:
-            await update.message.reply_text("מצטער, לא הצלחתי לעבד את הבקשה. נסה שוב.")
+            if not sent_msg:
+                await update.message.reply_text("מצטער, לא הצלחתי לעבד את הבקשה. נסה שוב.")
 
     except ollama.ResponseError as exc:
         _done_reaction = "😱"
