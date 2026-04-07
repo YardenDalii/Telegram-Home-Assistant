@@ -75,6 +75,9 @@ class Reminder(Base):
     Attributes:
         recurring: If True, a new reminder is created after firing.
         recurrence_type: One of 'daily', 'weekly', 'monthly', 'yearly'.
+        action_type: Optional device action to execute when reminder fires
+                     (e.g. 'hk_turn_on', 'hk_turn_off').
+        action_payload: Device ID to act on (e.g. 'switcher').
     """
 
     __tablename__ = "reminders"
@@ -87,6 +90,8 @@ class Reminder(Base):
     fired: Mapped[bool] = mapped_column(Boolean, default=False)
     recurring: Mapped[bool] = mapped_column(Boolean, default=False)
     recurrence_type: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    action_type: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    action_payload: Mapped[str | None] = mapped_column(String(200), nullable=True)
 
     def __repr__(self) -> str:
         return f"Reminder(id={self.id}, user_id={self.user_id}, text='{self.text[:30]}')"
@@ -233,6 +238,8 @@ def init_db() -> None:
         "ALTER TABLE user_profiles ADD COLUMN gender VARCHAR(10)",
         "ALTER TABLE reminders ADD COLUMN recurring BOOLEAN DEFAULT 0",
         "ALTER TABLE reminders ADD COLUMN recurrence_type VARCHAR(20)",
+        "ALTER TABLE reminders ADD COLUMN action_type VARCHAR(50)",
+        "ALTER TABLE reminders ADD COLUMN action_payload VARCHAR(200)",
         "DROP TABLE IF EXISTS calendar_events",
     ]
     with _engine.connect() as conn:
@@ -370,6 +377,8 @@ def add_reminder(
     remind_at: datetime,
     recurring: bool = False,
     recurrence_type: str | None = None,
+    action_type: str | None = None,
+    action_payload: str | None = None,
 ) -> "Reminder | None":
     """Persist a new reminder."""
     try:
@@ -380,6 +389,8 @@ def add_reminder(
                 remind_at=remind_at,
                 recurring=recurring,
                 recurrence_type=recurrence_type,
+                action_type=action_type,
+                action_payload=action_payload,
             )
             session.add(r)
             session.commit()
@@ -442,6 +453,8 @@ def mark_reminder_fired(reminder_id: int) -> None:
                         remind_at=next_dt,
                         recurring=True,
                         recurrence_type=r.recurrence_type,
+                        action_type=r.action_type,
+                        action_payload=r.action_payload,
                     ))
             r.fired = True
             session.commit()

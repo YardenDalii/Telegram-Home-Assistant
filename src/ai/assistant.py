@@ -200,9 +200,10 @@ _PROMPT_CALENDAR = (
 _PROMPT_HK = (
     "\n\n== Smart device control ==\n"
     "You MUST call a tool for every device request. NEVER respond with text only.\n"
-    "hk_turn_on: call this whenever the user wants a device ON — including 'תוכל להדליק', "
-    "'אפשר להדליק', 'תדליק בבקשה', 'הדלק'. Do NOT reply with text saying you will do it — just call the tool.\n"
-    "hk_turn_off: call this whenever the user wants a device OFF.\n"
+    "hk_turn_on: call this whenever the user wants a device ON immediately.\n"
+    "hk_turn_off: call this whenever the user wants a device OFF immediately.\n"
+    "schedule_device_action: call this when the user wants a device turned on/off AFTER a delay "
+    "('בעוד 5 דקות', 'בעוד שעה'). Use action='turn_on' or action='turn_off'.\n"
     "hk_get_status: ONLY when user asks for current state ('מה מצב', 'האם דולק').\n"
     "hk_list_devices: list all devices.\n"
     "hk_set_brightness: brightness 0-100.\n"
@@ -510,6 +511,36 @@ _HK_TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "schedule_device_action",
+            "description": (
+                "Schedule a device to turn on or off automatically after a delay. "
+                "Use this when the user says 'in X minutes', 'in an hour', etc. "
+                "Do NOT use hk_turn_on/hk_turn_off for delayed requests — use this instead."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "device_name": {
+                        "type": "string",
+                        "description": "Device name as the user said it (Hebrew or English)",
+                    },
+                    "action": {
+                        "type": "string",
+                        "enum": ["turn_on", "turn_off"],
+                        "description": "Action to perform when the timer fires",
+                    },
+                    "minutes": {
+                        "type": "integer",
+                        "description": "Minutes from now to execute the action",
+                    },
+                },
+                "required": ["device_name", "action", "minutes"],
+            },
+        },
+    },
 ]
 
 _CALENDAR_TOOLS = [
@@ -643,13 +674,40 @@ def _select_tools(user_text: str) -> list:
 # ---------------------------------------------------------------------------
 
 async def _send_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Job callback — fires when a scheduled reminder is due."""
+    """Job callback — fires when a scheduled reminder is due.
+
+    If the reminder has an action_type, executes the device command automatically
+    and notifies the user of the result instead of a plain reminder text.
+    """
     data = context.job.data
-    await context.bot.send_message(
-        chat_id=data["chat_id"],
-        text=f"⏰ *תזכורת:* {data['text']}",
-        parse_mode="Markdown",
-    )
+    action_type = data.get("action_type")
+    action_payload = data.get("action_payload")
+
+    if action_type:
+        # Execute the scheduled device action
+        action_ok = False
+        try:
+            if action_type == "hk_turn_on" and action_payload == "switcher":
+                await _switcher_dev.turn_on()
+                action_ok = True
+            elif action_type == "hk_turn_off" and action_payload == "switcher":
+                await _switcher_dev.turn_off()
+                action_ok = True
+        except Exception as exc:
+            logger.error(f"Scheduled device action '{action_type}' failed: {exc}")
+        status = "✅" if action_ok else "❌ נכשל —"
+        await context.bot.send_message(
+            chat_id=data["chat_id"],
+            text=f"⏰ {status} *{data['text']}*",
+            parse_mode="Markdown",
+        )
+    else:
+        await context.bot.send_message(
+            chat_id=data["chat_id"],
+            text=f"⏰ *תזכורת:* {data['text']}",
+            parse_mode="Markdown",
+        )
+
     mark_reminder_fired(data["reminder_id"])
 
     # Re-schedule next occurrence for recurring reminders.
@@ -671,6 +729,8 @@ async def _send_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
                         "text": r.text,
                         "reminder_id": r.id,
                         "recurring": True,
+                        "action_type": r.action_type,
+                        "action_payload": r.action_payload,
                     },
                     name=f"reminder_{r.id}",
                 )
@@ -687,7 +747,14 @@ def reschedule_pending_reminders(job_queue: Any) -> None:
         job_queue.run_once(
             _send_reminder,
             when=delay,
-            data={"chat_id": r.user_id, "text": r.text, "reminder_id": r.id, "recurring": r.recurring},
+            data={
+                "chat_id": r.user_id,
+                "text": r.text,
+                "reminder_id": r.id,
+                "recurring": r.recurring,
+                "action_type": r.action_type,
+                "action_payload": r.action_payload,
+            },
             name=f"reminder_{r.id}",
         )
     if pending:
@@ -1193,6 +1260,58 @@ async def _handle_hk_get_status(args, user_id, username, job_queue, bot) -> str:
     return f"⚙️ קריאת מצב *{_device_display_name(dev)}* עדיין לא ממומשת."
 
 
+@_tool("schedule_device_action")
+async def _handle_schedule_device_action(args, user_id, username, job_queue, bot) -> str:
+    """Schedule a device turn-on or turn-off to happen automatically after a delay."""
+    device_name = str(args.get("device_name", "")).strip()
+    action = str(args.get("action", "")).strip()
+    minutes = int(args.get("minutes", 0))
+
+    if minutes <= 0:
+        return "⚠️ יש להזין מספר דקות חיובי."
+    if action not in ("turn_on", "turn_off"):
+        return "⚠️ פעולה לא מוכרת — השתמש ב-turn_on או turn_off."
+
+    dev = _find_device(device_name)
+    if not dev:
+        return _no_match_msg(device_name)
+    if dev["type"] != "switcher":
+        return f"⚙️ תזמון פעולה עבור *{_device_display_name(dev)}* עדיין לא נתמך."
+    if not _switcher_configured():
+        return "⚙️ ה-Switcher לא מוגדר. הוסף SWITCHER_DEVICE_IP ו-SWITCHER_DEVICE_ID ל-.env."
+
+    action_label = "הדלקת" if action == "turn_on" else "כיבוי"
+    dev_name = _device_display_name(dev)
+    reminder_text = f"{action_label} {dev_name}"
+    action_type = f"hk_{action}"
+
+    remind_at = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=minutes)
+    reminder = add_reminder(
+        user_id, reminder_text, remind_at,
+        action_type=action_type, action_payload=dev["id"],
+    )
+    if not reminder:
+        return "❌ לא הצלחתי לתזמן את הפעולה."
+
+    if job_queue:
+        job_queue.run_once(
+            _send_reminder,
+            when=timedelta(minutes=minutes),
+            data={
+                "chat_id": user_id,
+                "text": reminder_text,
+                "reminder_id": reminder.id,
+                "recurring": False,
+                "action_type": action_type,
+                "action_payload": dev["id"],
+            },
+            name=f"reminder_{reminder.id}",
+        )
+
+    verb = "יידלק" if action == "turn_on" else "יכבה"
+    return f"⏱️ מתוזמן! *{dev_name}* {verb} בעוד {minutes} דקות."
+
+
 # ---------------------------------------------------------------------------
 # Fallback: parse tool calls leaked as plain text
 # ---------------------------------------------------------------------------
@@ -1205,6 +1324,7 @@ _KNOWN_TOOLS = {
     "broadcast_message", "leave_note",
     "get_schedule", "add_event",
     "hk_list_devices", "hk_turn_on", "hk_turn_off", "hk_set_brightness", "hk_get_status",
+    "schedule_device_action",
 }
 
 # Tools whose output is returned verbatim — no AI second-pass summarization.
